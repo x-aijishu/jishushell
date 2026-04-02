@@ -1,0 +1,47 @@
+# Environment
+.env
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/package-lock.json
+
+# Build output
+dist/
+public/
+
+# npm pack artifacts
+*.tgz
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code (local tooling, not part of app)
+.claude/
+CLAUDE.md
+
+# OpenCode (local AI tooling)
+.opencode/
+
+# macOS
+.DS_Store
+
+# Debug
+debug/
+
+# Install logs
+jishu-install-*.log
+
+# Test coverage & reports
+coverage/
+frontend/coverage/
+test-results.xml
+
+#Install Logs
+install/jishu-install-*.log
+
+
+*Zone.Identifier

@@ -1,0 +1,41 @@
+JishuShell
+Copyright (c) 2026 JishuShell Contributors
+Licensed under the Apache License, Version 2.0.
+
+This NOTICE file is provided in accordance with Section 4(d) of the
+Apache License, Version 2.0, and as a general disclosure of third-party
+software bundled with or installed by this product.
+
+┌─────────────────────────────────────────────────────────┐
+│           THIRD-PARTY SOFTWARE NOTICE                   │
+└─────────────────────────────────────────────────────────┘
+
+  JishuShell assists in downloading and configuring the following
+  third-party software packages for personal and internal use only.
+  Each package is governed solely by its own license. JishuShell
+  does not modify, relicense, or assert ownership over any of them.
+
+  You are the end user of these packages. You are solely
+  responsible for ensuring that your use of each package complies
+  with its respective license terms, including any restrictions on
+  commercial use, competitive offerings, or redistribution.
+
+  Docker Engine
+    URL     : https://github.com/moby/moby
+    License : Apache License, Version 2.0
+              https://www.apache.org/licenses/LICENSE-2.0
+    Author  : Docker, Inc.
+
+  Nomad v1.11.3+ (>= 1.7.0)
+    URL     : https://github.com/hashicorp/nomad
+    License : Business Source License 1.1 (BSL 1.1)
+              https://github.com/hashicorp/nomad/blob/main/LICENSE
+    Licensor: International Business Machines Corporation (IBM)
+    Work    : Nomad Version 1.7.0 or later. (c) 2024 IBM Corp.
+
+    You, as the operator deploying this software, are the end user of
+    Nomad and are solely responsible for ensuring your use complies with
+    the BSL 1.1 terms, including any restrictions on competitive or
+    commercial use. For licensing details and FAQ, see:
+    https://www.hashicorp.com/license-faq
+

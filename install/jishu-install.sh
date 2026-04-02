@@ -2900,6 +2900,10 @@ _jishu_install_main() {
     detect_os
     detect_arch
     show_install_plan --with-jishushell
+    if [[ "$OS" == "macos" ]]; then
+        ui_warn "macOS is not supported yet — coming soon!"
+        exit 0
+    fi
     _prompt_install_confirm
     check_sudo
     ensure_prerequisites

@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+# Self-contained OpenClaw runtime image with entrypoint version-switch.
+# Build:  docker build -f Dockerfile.openclaw-slim -t jishushell-openclaw:slim .
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+# ── Stage 1: install ──
+FROM ${NODE_IMAGE} AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install OpenClaw (skip dev deps)
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g --prefix /app openclaw@latest \
+    --omit=dev --no-audit --no-fund
+
+# OpenClaw's postinstall script installs bundled plugin runtime deps
+# (e.g. @buape/carbon for Discord) into the top-level node_modules.
+# npm runs it automatically but it may fail silently (non-fatal).
+# Re-run it explicitly to ensure all deps are installed.
+# Requires git (some deps use git+ssh: protocol — rewrite to https).
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" && \
+    cd /app/lib/node_modules/openclaw && \
+    node scripts/postinstall-bundled-plugins.mjs 2>&1 || true
+
+# ── Stage 2: final runtime image ──
+FROM ${NODE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    procps hostname curl git lsof openssl \
+    python3 python3-pip python3-venv && \
+    ln -sf /usr/bin/python3 /usr/local/bin/python && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -f /usr/lib/python*/EXTERNALLY-MANAGED
+
+# Copy OpenClaw from builder
+COPY --from=builder /app/lib/node_modules/ /app/node_modules/
+RUN ln -sf /app/node_modules/openclaw/openclaw.mjs /app/openclaw.mjs && \
+    # Backward-compat: old code references /usr/local/bin/openclaw
+    ln -sf /usr/local/bin/openclaw-entry.sh /usr/local/bin/openclaw && \
+    cp /app/node_modules/openclaw/package.json /app/package.json 2>/dev/null || true
+
+# Entrypoint wrapper
+COPY openclaw-entry.sh /usr/local/bin/openclaw-entry.sh
+RUN chmod +x /usr/local/bin/openclaw-entry.sh
+
+WORKDIR /app
+USER node
+ENTRYPOINT ["/usr/local/bin/openclaw-entry.sh"]
+CMD ["gateway", "--allow-unconfigured"]

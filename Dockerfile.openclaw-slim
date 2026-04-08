@@ -9,9 +9,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Install OpenClaw (skip dev deps)
-RUN --mount=type=cache,target=/root/.npm \
-    npm install -g --prefix /app openclaw@latest \
+# Install OpenClaw (skip dev deps, no cache to ensure latest version)
+RUN npm install -g --prefix /app openclaw@latest \
     --omit=dev --no-audit --no-fund
 
 # OpenClaw's postinstall script installs bundled plugin runtime deps

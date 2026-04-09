@@ -5,12 +5,14 @@ ARG NODE_IMAGE=node:22-bookworm-slim
 
 # ── Stage 1: install ──
 FROM ${NODE_IMAGE} AS builder
+ARG OPENCLAW_VERSION=latest
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Install OpenClaw (skip dev deps, no cache to ensure latest version)
-RUN npm install -g --prefix /app openclaw@latest \
+# Install the requested OpenClaw version. The build arg becomes part of the
+# layer cache key so a new upstream release cannot silently reuse an older install.
+RUN npm install -g --prefix /app "openclaw@${OPENCLAW_VERSION}" \
     --omit=dev --no-audit --no-fund
 
 # OpenClaw's postinstall script installs bundled plugin runtime deps

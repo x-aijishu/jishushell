@@ -36,10 +36,22 @@ jobs:
           echo "Latest OpenClaw version: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-          # Check if this version already exists in ghcr.io
+          # If the tag exists, verify the image actually contains the expected
+          # OpenClaw version before skipping the rebuild.
           if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION > /dev/null 2>&1; then
-            echo "Image for $VERSION already exists, skipping"
-            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "Image tag for $VERSION exists, verifying bundled OpenClaw version"
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION > /dev/null
+            IMAGE_VERSION=$(docker run --rm --entrypoint node ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION \
+              -p "require('/app/node_modules/openclaw/package.json').version")
+            echo "Bundled OpenClaw version in existing image: $IMAGE_VERSION"
+
+            if [ "$IMAGE_VERSION" = "$VERSION" ]; then
+              echo "Image for $VERSION already exists with the correct bundled version, skipping"
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            else
+              echo "Image tag $VERSION exists but bundles $IMAGE_VERSION, rebuilding"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            fi
           else
             echo "Image for $VERSION not found, will build"
             echo "should_build=true" >> $GITHUB_OUTPUT
@@ -81,6 +93,8 @@ jobs:
         with:
           context: .
           file: Dockerfile.openclaw-slim
+          build-args: |
+            OPENCLAW_VERSION=${{ needs.check.outputs.version }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
@@ -98,6 +112,13 @@ jobs:
       - name: Verify image
         run: |
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }}
+          IMAGE_VERSION=$(docker run --rm --entrypoint node ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }} \
+            -p "require('/app/node_modules/openclaw/package.json').version")
+          echo "Bundled OpenClaw version: $IMAGE_VERSION"
+          if [ "$IMAGE_VERSION" != "${{ needs.check.outputs.version }}" ]; then
+            echo "Expected OpenClaw ${{ needs.check.outputs.version }}, got $IMAGE_VERSION" >&2
+            exit 1
+          fi
           docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }} --version
 
       - name: Summary

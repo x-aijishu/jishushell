@@ -26,6 +26,14 @@ RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.co
 
 # ── Stage 2: final runtime image ──
 FROM ${NODE_IMAGE}
+# Re-declare the ARG so it's available in this stage (Docker ARG scope is
+# per-stage). Inject it as an OCI label so `docker inspect` reports the real
+# bundled OpenClaw version for both CI and local-fallback builds.
+ARG OPENCLAW_VERSION=latest
+LABEL org.opencontainers.image.title="OpenClaw Runtime"
+LABEL org.opencontainers.image.description="Self-contained OpenClaw runtime with Python and version-switch entrypoint"
+LABEL org.opencontainers.image.version="${OPENCLAW_VERSION}"
+LABEL org.opencontainers.image.source="https://github.com/x-aijishu/jishushell"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     procps hostname curl git lsof openssl \
     python3 python3-pip python3-venv && \

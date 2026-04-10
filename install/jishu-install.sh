@@ -224,7 +224,7 @@ SKIP_OPENCLAW="${SKIP_OPENCLAW:-0}"  # default=0 (install); use --skip 4 or --sk
 SKIP_JISHUSHELL="${SKIP_JISHUSHELL:-0}"          # 1=skip install_jishushell
 SKIP_JISHUSHELL_SERVICE="${SKIP_JISHUSHELL_SERVICE:-0}"  # 1=skip service registration
 OPENCLAW_NPM_VERSION="${OPENCLAW_NPM_VERSION:-latest}"   # openclaw npm package version
-OPENCLAW_DOCKER_TAG="${OPENCLAW_DOCKER_TAG:-jishushell-openclaw:local}"  # locally built image with Python
+OPENCLAW_DOCKER_TAG="${OPENCLAW_DOCKER_TAG:-ghcr.io/x-aijishu/openclaw-runtime:latest}"  # pre-built image from registry
 OPENCLAW_IMAGE=""                                        # set dynamically after pull/build
 AUTO_YES="${AUTO_YES:-0}"
 DOCKER_CMD_PREFIX=""          # Set to "sg docker -c" when group activated via sg
@@ -405,18 +405,33 @@ detect_os() {
     ui_success "OS: ${OS_NAME} (package manager: ${PKG_MANAGER})"
 }
 
-# Detect CPU architecture.  Sets: ARCH (amd64 | arm64)
+# Detect CPU architecture.  Sets: ARCH (arm64)
+# Only Arm-family (aarch64, arm64, armv7l) and Apple Silicon (Darwin/arm64)
+# are supported.  x86_64, i686, riscv, mips, s390x, ppc, etc. are rejected.
 detect_arch() {
-    ARCH="$(uname -m)"
-    case "$ARCH" in
-        x86_64|amd64)    ARCH="amd64" ;;
-        aarch64|arm64)   ARCH="arm64" ;;
+    local raw_arch
+    raw_arch="$(uname -m)"
+    case "$raw_arch" in
+        aarch64|arm64)
+            ARCH="arm64"
+            ;;
+        armv7l|armv8l|armhf)
+            # 32-bit Arm — may work but not officially tested
+            ARCH="arm64"
+            ui_warn "32-bit Arm detected (${raw_arch}). 64-bit OS on a 64-bit board is strongly recommended."
+            ;;
         *)
-            ui_error "Unsupported CPU architecture: $ARCH"
+            ui_error "Unsupported CPU architecture: ${raw_arch}"
+            ui_error ""
+            ui_error "JishuShell runs exclusively on Arm-based devices (aarch64 / arm64)."
+            ui_error "Supported examples: Raspberry Pi 4/5, Orange Pi 5, Jetson Orin,"
+            ui_error "  Rockchip RK3588, Apple Silicon Mac (arm64 macOS)."
+            ui_error ""
+            ui_error "x86_64 / i686 / RISC-V / MIPS / s390x / PowerPC are not supported."
             exit 1
             ;;
     esac
-    ui_success "Architecture: ${ARCH}"
+    ui_success "Architecture: ${ARCH} (${raw_arch})"
 }
 
 # Verify sudo access.  Sets: SUDO ("" if root, "sudo" otherwise)
@@ -446,7 +461,7 @@ check_sudo() {
     # This ensures 'sudo docker' works even after a long Docker install step
     # without prompting for the password again.
     if [[ -z "${_SUDO_KEEPALIVE_PID:-}" ]]; then
-        ( while true; do sudo -n true 2>/dev/null; sleep 60; done ) &
+        ( while true; do sudo -n true 2>/dev/null; sleep 60; done ) &>/dev/null &
         _SUDO_KEEPALIVE_PID=$!
         disown "$_SUDO_KEEPALIVE_PID" 2>/dev/null || true
     fi
@@ -925,6 +940,41 @@ _ensure_nvm_shell_config() {
 install_docker() {
     ui_stage "Docker"
 
+    # ── macOS: use private Colima instance ─────────────────────────────────────
+    if [[ "$OS" == "macos" ]]; then
+        local need_brew=0
+        local need_profile=0
+
+        if ! command -v docker &>/dev/null || ! command -v colima &>/dev/null; then
+            need_brew=1
+            need_profile=1
+        elif ! _colima list 2>/dev/null | grep -q "${_COLIMA_PROFILE}"; then
+            need_profile=1
+        fi
+
+        if [[ $need_brew -eq 1 ]]; then
+            if ! _do_install_docker; then
+                ui_error "Colima installation failed"
+                return 1
+            fi
+        elif [[ $need_profile -eq 1 ]]; then
+            ui_info "Starting Colima VM (profile: ${_COLIMA_PROFILE})..."
+            mkdir -p "${_COLIMA_HOME}"
+            _colima start "${_COLIMA_PROFILE}" \
+                --vm-type vz --mount-type virtiofs --network-address \
+                --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null \
+                || { ui_warn "colima start failed — run 'COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}' manually"; return 1; }
+            export DOCKER_HOST="unix://${_COLIMA_SOCKET}"
+            ui_success "Colima is running"
+        else
+            ui_success "Docker and Colima already configured"
+        fi
+
+        _ensure_docker_running
+        return 0
+    fi
+
+    # ── Linux: standard Docker Engine ──────────────────────────────────────────
     local need_install_docker=0
     local need_install_compose=0
 
@@ -948,8 +998,6 @@ install_docker() {
         :
     elif command -v docker-compose &>/dev/null; then
         :
-    elif [[ "$OS" == "macos" ]]; then
-        :
     else
         need_install_compose=1
     fi
@@ -962,8 +1010,6 @@ install_docker() {
 
     if [[ $need_install_docker -eq 1 ]]; then
         ui_info "Docker not found — installing..."
-        # _do_install_docker installs docker-compose-plugin in the same apt command,
-        # so Compose V2 will be available immediately after — no separate step needed.
         if ! _do_install_docker; then
             ui_warn "Official Docker install script failed — trying system package manager fallback..."
             if ! _do_install_docker_apt_fallback; then
@@ -971,7 +1017,6 @@ install_docker() {
                 return 1
             fi
         fi
-        # Compose is bundled; skip the separate install step
         need_install_compose=0
     fi
 
@@ -995,13 +1040,23 @@ _do_install_docker() {
     fi
 
     if [[ "$OS" == "macos" ]]; then
-        ui_warn "Automated Docker installation is not supported on macOS"
-        ui_info "Please install Docker Desktop from https://www.docker.com/products/docker-desktop/"
-        if command -v brew &>/dev/null; then
-            ui_info "Or via Homebrew: brew install --cask docker"
+        ui_info "Installing docker and colima via Homebrew..."
+        if ! command -v brew &>/dev/null; then
+            ui_warn "Homebrew not found. Install it from https://brew.sh then re-run this script."
+            return 1
         fi
-        ui_info "After installation, open Docker Desktop and wait for the daemon to start, then re-run this script"
-        return 1
+        brew install -q docker colima || { ui_warn "brew install failed"; return 1; }
+        ui_success "docker and colima installed"
+
+        mkdir -p "${_COLIMA_HOME}"
+        ui_info "Starting Colima VM (profile: ${_COLIMA_PROFILE})..."
+        _colima start "${_COLIMA_PROFILE}" \
+            --vm-type vz --mount-type virtiofs --network-address \
+            --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null \
+            || { ui_warn "colima start failed — run 'COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}' manually"; return 1; }
+        ui_success "Colima is running"
+        export DOCKER_HOST="unix://${_COLIMA_SOCKET}"
+        return 0
     fi
 
     # Step 1: download
@@ -1096,7 +1151,7 @@ _do_install_docker_apt_fallback() {
     fi
 
     if [[ "$OS" == "macos" ]]; then
-        ui_warn "No apt/dnf fallback available on macOS — please install Docker Desktop manually"
+        ui_warn "No apt/dnf fallback available on macOS — install via Homebrew: brew install docker colima"
         return 1
     fi
 
@@ -1157,17 +1212,30 @@ _ensure_docker_running() {
     fi
 
     if [[ "$OS" == "macos" ]]; then
-        local waited=0
-        while ! docker info &>/dev/null 2>&1; do
-            if [[ $waited -ge 15 ]]; then
-                ui_warn "Docker daemon did not become ready within 15 seconds"
-                ui_info "Make sure Docker Desktop is open and running"
+        export DOCKER_HOST="unix://${_COLIMA_SOCKET}"
+        if ! docker info &>/dev/null 2>&1; then
+            ui_info "Starting Colima VM..."
+            mkdir -p "${_COLIMA_HOME}"
+            if ! _colima start "${_COLIMA_PROFILE}" \
+                --vm-type vz --mount-type virtiofs --network-address \
+                --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null; then
+                ui_warn "colima start failed"
+                ui_info "Run manually: COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}"
                 return 1
             fi
-            sleep 1
-            (( waited++ )) || true
+        fi
+        local waited=0
+        local timeout=120
+        while ! docker info &>/dev/null 2>&1; do
+            if [[ $waited -ge $timeout ]]; then
+                ui_warn "Docker daemon did not become ready within ${timeout} seconds"
+                ui_info "Run: COLIMA_HOME=${_COLIMA_HOME} colima status ${_COLIMA_PROFILE}"
+                return 1
+            fi
+            sleep 2
+            (( waited += 2 )) || true
         done
-        [[ $waited -lt 15 ]] && ui_success "Docker daemon is ready"
+        ui_success "Docker daemon is ready"
         return 0
     fi
 
@@ -1301,6 +1369,21 @@ docker_exec() {
     else
         docker "$@"
     fi
+}
+
+# Private Colima wrapper — runs colima with COLIMA_HOME scoped to JishuShell's
+# data directory so the VM, socket, and all state are fully isolated from any
+# user-level Docker Desktop or default Colima installation.
+#
+# Usage:  _colima start jishushell --vm-type vz ...
+#         _colima stop jishushell
+#         _colima status jishushell
+_COLIMA_HOME="${JISHUSHELL_HOME}/colima"
+_COLIMA_PROFILE="jishushell"
+_COLIMA_SOCKET="${_COLIMA_HOME}/${_COLIMA_PROFILE}/docker.sock"
+
+_colima() {
+    COLIMA_HOME="${_COLIMA_HOME}" command colima "$@"
 }
 
 # ─── 3. Nomad ────────────────────────────────────────────────────────────────
@@ -1531,17 +1614,29 @@ _install_nomad_binary() {
     ui_success "Nomad installed: v${installed_version} → ${dest}"
 }
 
-# Add ~/.jishushell/bin to PATH in shell startup files and current session
+# Add ~/.jishushell/bin and npm global bin to PATH in shell startup files and current session
 _ensure_jishushell_bin_in_path() {
     local bin_dir="${JISHUSHELL_BIN_DIR}"
     local marker="# jishushell-bin-path"
+
+    # Also ensure npm global bin is in PATH (for `npm install -g` with custom prefix)
+    local npm_bin=""
+    if command -v npm &>/dev/null; then
+        npm_bin="$(npm config get prefix 2>/dev/null)/bin"
+    fi
+
+    # Build PATH line: include npm global bin if it differs from jishushell bin
     local init_line="export PATH=\"${bin_dir}:\$PATH\""
+    if [[ -n "$npm_bin" && "$npm_bin" != "$bin_dir" && -d "$npm_bin" ]]; then
+        init_line="export PATH=\"${bin_dir}:${npm_bin}:\$PATH\""
+        export PATH="${npm_bin}:${PATH}"
+    fi
 
     # Export for the current running shell immediately
     export PATH="${bin_dir}:${PATH}"
 
     if [[ "$DRY_RUN" == "1" ]]; then
-        ui_info "[dry-run] Would add ${bin_dir} to PATH in shell startup files"
+        ui_info "[dry-run] Would add PATH entries in shell startup files"
         return 0
     fi
 
@@ -1550,7 +1645,7 @@ _ensure_jishushell_bin_in_path() {
     for rc in "${rc_files[@]}"; do
         if [[ -f "$rc" ]] && ! grep -qF "$marker" "$rc" 2>/dev/null; then
             printf '\n%s\n%s\n' "$marker" "$init_line" >> "$rc"
-            ui_info "Added ${bin_dir} to PATH in ${rc}"
+            ui_info "Added PATH entries in ${rc}"
             added=1
         fi
     done
@@ -1587,6 +1682,14 @@ _ensure_nomad_hcl() {
     # Dirs are created by the current user — no sudo needed
     chown -R "${REAL_USER}:${REAL_GID:-${REAL_USER}}" "${JISHUSHELL_HOME}" 2>/dev/null || true
 
+    # Loopback interface name: lo0 on macOS, lo on Linux.
+    # Forces Nomad to fingerprint 127.0.0.1 as the node IP so Docker port
+    # publishing binds to loopback instead of the LAN IP.  On macOS+Colima the
+    # LAN IP doesn't exist inside the Lima VM, causing "cannot assign requested
+    # address" when Docker tries to bind to it.
+    local loopback_iface="lo"
+    [[ "$OS" == "macos" ]] && loopback_iface="lo0"
+
     cat > "$config_file" << NOMAD_HCL
 data_dir = "${nomad_data_dir}"
 
@@ -1608,6 +1711,7 @@ server {
 client {
   enabled = true
   servers = ["127.0.0.1:4647"]
+  network_interface = "${loopback_iface}"
   alloc_dir = "${nomad_alloc_dir}"
 
   drain_on_shutdown {
@@ -1805,10 +1909,10 @@ _install_nomad_launchd() {
 
     mkdir -p "${HOME}/Library/LaunchAgents"
 
-    local docker_sock="${HOME}/.docker/run/docker.sock"
-    if [[ ! -S "$docker_sock" ]]; then
-        docker_sock="/var/run/docker.sock"
-    fi
+    # Always use JishuShell's private Colima socket — hardcoded, not runtime-detected.
+    # Colima may not be running yet when the plist is written; runtime fallback would
+    # pick the wrong socket (Docker Desktop or /var/run/docker.sock).
+    local docker_sock="${_COLIMA_SOCKET}"
 
     cat > "$plist_path" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1870,6 +1974,54 @@ fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
 " 2>/dev/null || true
 }
 
+_read_openclaw_image_from_panel() {
+    local panel_file="${JISHUSHELL_HOME}/panel.json"
+    node -e "
+const fs = require('fs');
+const p = '${panel_file}';
+try {
+  const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+  if (typeof cfg.openclaw_image === 'string' && cfg.openclaw_image.trim()) {
+    process.stdout.write(cfg.openclaw_image.trim());
+  }
+} catch {}
+" 2>/dev/null || true
+}
+
+_pin_openclaw_image_if_needed() {
+    local image="$1"
+    if [[ -z "${image}" ]]; then
+        return 1
+    fi
+    if [[ ! "${image}" =~ :(latest|slim)$ ]]; then
+        printf '%s' "${image}"
+        return 0
+    fi
+
+    local version=""
+    version="$(docker_exec run --rm --entrypoint node "${image}" -p "require('/app/node_modules/openclaw/package.json').version" 2>/dev/null | tr -d '\r\n')"
+    if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        printf '%s' "${image}"
+        return 0
+    fi
+
+    local repo="${image%:*}"
+    local pinned="${repo}:${version}"
+    if docker_exec image inspect "${pinned}" &>/dev/null 2>&1; then
+        printf '%s' "${pinned}"
+        return 0
+    fi
+
+    if docker_exec tag "${image}" "${pinned}" &>/dev/null 2>&1; then
+        docker_exec rmi "${image}" &>/dev/null 2>&1 || true
+        printf '%s' "${pinned}"
+        return 0
+    fi
+
+    printf '%s' "${image}"
+    return 0
+}
+
 # Install OpenClaw npm package on the host (for process manager / raw_exec modes).
 # Skipped when using official Docker image.
 _install_openclaw_npm() {
@@ -1921,25 +2073,15 @@ install_openclaw() {
         return 1
     fi
 
+    local docker_tag="${OPENCLAW_DOCKER_TAG}"
+    local configured_tag=""
+
     if [[ "$DRY_RUN" == "1" ]]; then
-        ui_info "[dry-run] Would: npm install -g --prefix openclaw@${OPENCLAW_NPM_VERSION}"
-        ui_info "[dry-run] Would: docker build -t jishushell-openclaw:<version> (npm package + Python)"
+        ui_info "[dry-run] Would: docker pull ${docker_tag} (fallback: local build)"
         return 0
     fi
 
-    # ── Step 1: Install OpenClaw npm package (used as docker build context) ──
-    _install_openclaw_npm || return 1
-
-    # Resolve versioned tag from installed package (e.g. jishushell-openclaw:2026.3.31)
-    local pkg_dir="${JISHUSHELL_HOME}/packages/openclaw"
-    local oc_ver
-    oc_ver="$(node -p "require('${pkg_dir}/lib/node_modules/openclaw/package.json').version" 2>/dev/null || echo "")"
-    local docker_tag="${OPENCLAW_DOCKER_TAG}"
-    if [[ -n "$oc_ver" ]]; then
-        docker_tag="jishushell-openclaw:${oc_ver}"
-    fi
-
-    # ── Step 2: Ensure Docker daemon is accessible ────────────────────────────
+    # ── Step 1: Ensure Docker daemon is accessible ────────────────────────────
     if ! docker_exec info &>/dev/null 2>&1; then
         if command -v sg &>/dev/null 2>/dev/null && sg docker -c "docker info" &>/dev/null 2>&1; then
             DOCKER_CMD_PREFIX="sg docker -c"
@@ -1950,7 +2092,7 @@ install_openclaw() {
         else
             ui_warn "Docker daemon is not reachable"
             if [[ "$OS" == "macos" ]]; then
-                ui_warn "Make sure Docker Desktop is running"
+                ui_warn "Run: COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}"
             else
                 ui_warn "Ensure Docker is running: sudo systemctl start docker"
             fi
@@ -1958,49 +2100,90 @@ install_openclaw() {
         fi
     fi
 
-    # ── Step 3: Skip if image already exists ──────────────────────────────────
-    if docker_exec image inspect "${docker_tag}" &>/dev/null 2>&1; then
-        OPENCLAW_IMAGE="${docker_tag}"
-        _save_openclaw_image_to_panel "${docker_tag}"
-        ui_success "Docker image ${docker_tag} already exists — skipping"
+    # ── Step 2: Reuse the currently configured pinned image if it already
+    # exists locally. This avoids re-pulling :latest on machines where the
+    # running JishuShell service has already migrated panel.json from a mutable
+    # tag (e.g. :latest) to an immutable version tag (e.g. :2026.4.9).
+    configured_tag="$(_read_openclaw_image_from_panel)"
+    if [[ -n "${configured_tag}" ]] && docker_exec image inspect "${configured_tag}" &>/dev/null 2>&1; then
+        OPENCLAW_IMAGE="$(_pin_openclaw_image_if_needed "${configured_tag}")"
+        _save_openclaw_image_to_panel "${OPENCLAW_IMAGE}"
+        ui_success "Docker image ${OPENCLAW_IMAGE} already exists — reusing configured image"
         return 0
     fi
 
-    # ── Step 4: Build Docker image (npm package + Python) ─────────────────────
-    local pkg_dir="${JISHUSHELL_HOME}/packages/openclaw"
+    # ── Step 3: Skip if the requested install tag already exists ─────────────
+    if docker_exec image inspect "${docker_tag}" &>/dev/null 2>&1; then
+        OPENCLAW_IMAGE="$(_pin_openclaw_image_if_needed "${docker_tag}")"
+        _save_openclaw_image_to_panel "${OPENCLAW_IMAGE}"
+        ui_success "Docker image ${OPENCLAW_IMAGE} already exists — skipping"
+        return 0
+    fi
 
-    # Write Dockerfile into the npm package directory (build context)
-    cat > "${pkg_dir}/Dockerfile" << 'DOCKERFILE'
-FROM node:22-slim
-USER root
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    procps hostname curl git lsof openssl \
-    python3 python3-pip python3-venv python3-dev && \
-    ln -sf /usr/bin/python3 /usr/local/bin/python && \
-    rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY --chown=node:node lib/node_modules/ ./node_modules/
-RUN ln -sf /app/node_modules/openclaw/openclaw.mjs /app/openclaw.mjs && \
-    ln -sf /app/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
-    cp /app/node_modules/openclaw/package.json /app/package.json 2>/dev/null || true
-USER node
-CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
-DOCKERFILE
-
-    ui_info "Building Docker image: ${docker_tag} (npm package + Python)..."
+    # ── Step 4: Pull from registry, fallback to local build ──────────────────
+    ui_info "Pulling OpenClaw Docker image: ${docker_tag} ..."
     log_detail ""
-    log_detail "[$(date '+%H:%M:%S')] docker build -t ${docker_tag} ${pkg_dir}"
-    if log_cmd docker_exec build --network=host -t "${docker_tag}" "${pkg_dir}"; then
+    log_detail "[$(date '+%H:%M:%S')] docker pull ${docker_tag}"
+    if log_cmd docker_exec pull "${docker_tag}"; then
+        OPENCLAW_IMAGE="$(_pin_openclaw_image_if_needed "${docker_tag}")"
+        _save_openclaw_image_to_panel "${OPENCLAW_IMAGE}"
+        ui_success "OpenClaw Docker image pulled: ${OPENCLAW_IMAGE}"
+        return 0
+    fi
+
+    # ── Step 3b: Fallback — build locally using bundled Dockerfile ────
+    ui_warn "Pull failed, falling back to local build..."
+
+    # Locate the bundled Dockerfile.openclaw-slim + openclaw-entry.sh.
+    # Both ship at the npm package root, alongside the install/ directory,
+    # so from this script's perspective they are one level up.
+    local script_dir
+    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    else
+        script_dir="${PWD}"
+    fi
+    local dockerfile_src="${script_dir}/../Dockerfile.openclaw-slim"
+    local entrypoint_src="${script_dir}/../openclaw-entry.sh"
+
+    if [[ ! -f "${dockerfile_src}" || ! -f "${entrypoint_src}" ]]; then
+        ui_error "Bundled build files not found near ${script_dir}/.."
+        ui_error "Expected: Dockerfile.openclaw-slim and openclaw-entry.sh"
+        return 1
+    fi
+
+    local build_ctx
+    build_ctx="$(mktemp -d)"
+    trap "rm -rf '${build_ctx}'" EXIT
+
+    cp "${dockerfile_src}" "${build_ctx}/Dockerfile.openclaw-slim"
+    cp "${entrypoint_src}" "${build_ctx}/openclaw-entry.sh"
+
+    # Query current OpenClaw version from npm so the --build-arg busts the
+    # Docker layer cache for the `RUN npm install openclaw@${ver}` step.
+    # Fall back to "latest" if npm is unreachable.
+    local openclaw_ver
+    openclaw_ver="$(npm view openclaw version 2>/dev/null)"
+    if [[ -z "${openclaw_ver}" ]]; then
+        openclaw_ver="latest"
+    fi
+    log_detail "Resolved OpenClaw version for build: ${openclaw_ver}"
+
+    ui_info "Building OpenClaw Docker image locally: ${docker_tag} (openclaw@${openclaw_ver}) ..."
+    log_detail ""
+    log_detail "[$(date '+%H:%M:%S')] docker build --network=host --build-arg OPENCLAW_VERSION=${openclaw_ver} -f Dockerfile.openclaw-slim -t ${docker_tag} ${build_ctx}"
+    if log_cmd docker_exec build --network=host \
+        --build-arg "OPENCLAW_VERSION=${openclaw_ver}" \
+        -f "${build_ctx}/Dockerfile.openclaw-slim" \
+        -t "${docker_tag}" "${build_ctx}"; then
         OPENCLAW_IMAGE="${docker_tag}"
         _save_openclaw_image_to_panel "${docker_tag}"
-        local _local_tag="jishushell-openclaw:local"
-        if [[ "${docker_tag}" != "${_local_tag}" ]]; then
-            docker_exec tag "${docker_tag}" "${_local_tag}" 2>/dev/null || true
-        fi
-        rm -f "${pkg_dir}/Dockerfile"
-        ui_success "OpenClaw Docker image built: ${docker_tag} (with Python)"
+        rm -rf "${build_ctx}"
+        trap - EXIT
+        ui_success "OpenClaw Docker image built: ${docker_tag}"
     else
-        rm -f "${pkg_dir}/Dockerfile"
+        rm -rf "${build_ctx}"
+        trap - EXIT
         ui_error "Failed to build OpenClaw Docker image"
         return 1
     fi
@@ -2043,7 +2226,7 @@ show_install_plan() {
     ui_kv "Node.js"     "$(if [[ $SKIP_NODE   -eq 1 ]]; then echo 'skip'; else echo "v${NODE_VERSION} via nvm v${NVM_VERSION}"; fi)"
     ui_kv "Docker"      "$(if [[ $SKIP_DOCKER -eq 1 ]]; then echo 'skip'; else echo 'latest stable'; fi)"
     ui_kv "Nomad"       "$(if [[ $SKIP_NOMAD  -eq 1 ]]; then echo 'skip'; else echo "v${NOMAD_VERSION}"; fi)"
-    ui_kv "OpenClaw"    "$(if [[ \"${SKIP_OPENCLAW}\" == \"1\" ]]; then echo 'skip'; else echo \"openclaw@${OPENCLAW_NPM_VERSION} + docker build ${OPENCLAW_DOCKER_TAG}\"; fi)"
+    ui_kv "OpenClaw"    "$(if [[ \"${SKIP_OPENCLAW}\" == \"1\" ]]; then echo 'skip'; else echo \"docker pull ${OPENCLAW_DOCKER_TAG}\"; fi)"
     if [[ $with_jishushell -eq 1 ]]; then
         local _plan_jishu
         if [[ $SKIP_JISHUSHELL -eq 1 ]]; then
@@ -2114,7 +2297,15 @@ show_summary() {
     fi
 
     if [[ "${SKIP_OPENCLAW}" != "1" ]]; then
-        if [[ -n "${OPENCLAW_IMAGE}" ]] && docker_exec image inspect "${OPENCLAW_IMAGE}" &>/dev/null 2>&1; then
+        local _summary_openclaw_image=""
+        _summary_openclaw_image="$(_read_openclaw_image_from_panel)"
+        if [[ -z "${_summary_openclaw_image}" && -n "${OPENCLAW_IMAGE}" ]]; then
+            _summary_openclaw_image="${OPENCLAW_IMAGE}"
+        fi
+
+        if [[ -n "${_summary_openclaw_image}" ]] && docker_exec image inspect "${_summary_openclaw_image}" &>/dev/null 2>&1; then
+            ui_kv "OpenClaw" "✓ ${_summary_openclaw_image}"
+        elif [[ -n "${OPENCLAW_IMAGE}" ]] && docker_exec image inspect "${OPENCLAW_IMAGE}" &>/dev/null 2>&1; then
             ui_kv "OpenClaw" "✓ ${OPENCLAW_IMAGE}"
         elif [[ "$DRY_RUN" == "1" ]]; then
             ui_kv "OpenClaw" "- dry-run"
@@ -2462,7 +2653,9 @@ WantedBy=multi-user.target"
         ${SUDO} systemctl restart jishushell 2>/dev/null || true
         ui_success "JishuShell systemd service updated and restarted"
     else
-        ui_success "JishuShell systemd service already installed"
+        # Package may have been upgraded — always restart to pick up new code
+        ${SUDO} systemctl restart jishushell 2>/dev/null || true
+        ui_success "JishuShell systemd service restarted"
     fi
 }
 
@@ -2672,7 +2865,7 @@ Steps:
   1  Node.js   (via nvm)
   2  Docker
   3  Nomad
-  4  OpenClaw  (npm install + docker build)
+  4  OpenClaw  (docker pull / local build)
   5  JishuShell
   6  JishuShell service registration (autostart)
 
@@ -2735,27 +2928,37 @@ _prompt_install_confirm() {
         echo -e "  commercial use, competitive offerings, or redistribution."
         echo ""
 
-        if [[ $SKIP_DOCKER -eq 0 ]]; then
+        if [[ $SKIP_DOCKER -eq 0 && "$OS" == "linux" ]]; then
             echo -e "  ${BOLD}Docker Engine${NC}"
-            echo -e "  ${MUTED}  URL     : https://github.com/moby/moby${NC}"
-            echo -e "  ${MUTED}  License : Apache License, Version 2.0${NC}"
-            echo -e "  ${MUTED}            https://www.apache.org/licenses/LICENSE-2.0${NC}"
-            echo -e "  ${MUTED}  Author  : Docker, Inc.${NC}"
+            echo -e "  ${MUTED}  Docker Engine (container runtime — Linux)${NC}"
+            echo -e "  ${MUTED}    URL     : https://github.com/moby/moby${NC}"
+            echo -e "  ${MUTED}    License : Apache License, Version 2.0${NC}"
+            echo -e "  ${MUTED}    Author  : Docker, Inc.${NC}"
+            echo -e "  ${MUTED}  https://github.com/moby/moby/blob/master/LICENSE${NC}"
+            echo ""
+        fi
+        if [[ $SKIP_DOCKER -eq 0 && "$OS" == "macos" ]]; then
+            echo -e "  ${BOLD}Colima${NC}"
+            echo -e "  ${MUTED}  Colima (container runtime — macOS)${NC}"
+            echo -e "  ${MUTED}    URL     : https://github.com/abiosoft/colima${NC}"
+            echo -e "  ${MUTED}    License : MIT License${NC}"
+            echo -e "  ${MUTED}              https://github.com/abiosoft/colima/blob/main/LICENSE${NC}"
+            echo -e "  ${MUTED}    Author  : Abiola Ibrahim${NC}"
             echo ""
         fi
         if [[ $SKIP_NOMAD -eq 0 ]]; then
-            echo -e "  ${BOLD}Nomad v${NOMAD_VERSION}+ (>= 1.7.0)${NC}"
-            echo -e "  ${MUTED}  URL     : https://github.com/hashicorp/nomad${NC}"
-            echo -e "  ${MUTED}  License : Business Source License 1.1 (BSL 1.1)${NC}"
-            echo -e "  ${MUTED}            https://github.com/hashicorp/nomad/blob/main/LICENSE${NC}"
-            echo -e "  ${MUTED}  Licensor: International Business Machines Corporation (IBM)${NC}"
-            echo -e "  ${MUTED}  Work    : Nomad Version 1.7.0 or later. (c) 2024 IBM Corp.${NC}"
+            echo -e "  ${BOLD}Nomad${NC}"
+            echo -e "  ${MUTED}  Nomad v${NOMAD_VERSION}+ (>= 1.7.0)${NC}"
+            echo -e "  ${MUTED}    URL     : https://github.com/hashicorp/nomad${NC}"
+            echo -e "  ${MUTED}    License : Business Source License 1.1 (BSL 1.1)${NC}"
+            echo -e "  ${MUTED}              https://github.com/hashicorp/nomad/blob/main/LICENSE${NC}"
+            echo -e "  ${MUTED}    Licensor: International Business Machines Corporation (IBM)${NC}"
+            echo -e "  ${MUTED}    Work    : Nomad Version 1.7.0 or later. (c) 2024 IBM Corp.${NC}"
             echo ""
         fi
-        echo -e "  ${MUTED}─────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${MUTED}By continuing you acknowledge that you have read the above${NC}"
-        echo -e "  ${MUTED}notices and agree to each package's license terms.${NC}"
-        echo -e "  ${MUTED}sudo privileges are required to write to system directories.${NC}"
+        echo -e "  ${ACCENT}─────────────────────────────────────────────────────────${NC}"
+        echo -e "  By continuing you acknowledge that you have read the above"
+        echo -e "  notices and agree to each package's license terms."
         echo ""
     } >/dev/tty
 
@@ -2767,6 +2970,9 @@ _prompt_install_confirm() {
             exit 0
             ;;
     esac
+
+    echo "" >/dev/tty
+    echo -e "  ${INFO}sudo privileges are required to write to system directories.${NC}" >/dev/tty
     echo "" >/dev/tty
 }
 
@@ -2885,7 +3091,7 @@ _jishu_install_main() {
     # so the keepalive's early sudo -n true calls are intentional no-ops.
     if [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null; then
         if [[ -z "${_SUDO_KEEPALIVE_PID:-}" ]]; then
-            ( while true; do sudo -n true 2>/dev/null; sleep 60; done ) &
+            ( while true; do sudo -n true 2>/dev/null; sleep 60; done ) &>/dev/null &
             _SUDO_KEEPALIVE_PID=$!
             disown "$_SUDO_KEEPALIVE_PID" 2>/dev/null || true
         fi
@@ -2900,10 +3106,6 @@ _jishu_install_main() {
     detect_os
     detect_arch
     show_install_plan --with-jishushell
-    if [[ "$OS" == "macos" ]]; then
-        ui_warn "macOS is not supported yet — coming soon!"
-        exit 0
-    fi
     _prompt_install_confirm
     check_sudo
     ensure_prerequisites

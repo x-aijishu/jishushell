@@ -1,11 +1,8 @@
 name: Build OpenClaw Runtime Image
 
 # Triggers:
-#   - Daily at 04:00 UTC: check npm for new OpenClaw version
-#   - Manual: build on demand (optionally pin a version)
+#   - Manual only: build on demand (optionally pin a version)
 on:
-  schedule:
-    - cron: '17 4 * * *'
   workflow_dispatch:
     inputs:
       openclaw_version:

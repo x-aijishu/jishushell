@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       hermes_version:
-        description: "Hermes version to build (default: latest)"
+        description: "Hermes release version to build (default: latest release tag)"
         default: "latest"
         required: false
 
@@ -29,12 +29,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          REF=""
           REQUESTED_VERSION="${{ github.event.inputs.hermes_version }}"
+          REF=""
           if [ -z "$REQUESTED_VERSION" ] || [ "$REQUESTED_VERSION" = "latest" ]; then
-            REF="main"
+            TAG_REF="$(
+              git ls-remote --refs --tags "${{ env.HERMES_REPO }}" \
+                | awk '{print $2}' \
+                | sed 's#refs/tags/##' \
+                | grep -E '^v?[0-9]+(\.[0-9]+)*([.-][0-9A-Za-z.-]+)?$' \
+                | sed 's/^v//' \
+                | sort -V \
+                | tail -n 1
+            )"
+            if [ -z "$TAG_REF" ]; then
+              echo "Could not resolve the latest Hermes release tag" >&2
+              exit 1
+            fi
+            REF="refs/tags/v${TAG_REF}"
+            if ! git ls-remote "${{ env.HERMES_REPO }}" "$REF" | grep -q .; then
+              REF="refs/tags/${TAG_REF}"
+            fi
           else
-            for CANDIDATE in "refs/tags/${REQUESTED_VERSION}" "refs/tags/v${REQUESTED_VERSION}" "${REQUESTED_VERSION}"; do
+            if printf '%s' "$REQUESTED_VERSION" | grep -Eq '[/:]'; then
+              echo "Only release versions/tags are accepted, got: $REQUESTED_VERSION" >&2
+              exit 1
+            fi
+            for CANDIDATE in "refs/tags/${REQUESTED_VERSION}" "refs/tags/v${REQUESTED_VERSION}"; do
               SHA="$(git ls-remote "${{ env.HERMES_REPO }}" "$CANDIDATE" | awk 'NR==1 {print $1}')"
               if [ -n "$SHA" ]; then
                 REF="$CANDIDATE"
@@ -42,14 +62,14 @@ jobs:
               fi
             done
             if [ -z "$REF" ]; then
-              echo "Could not resolve Hermes version: $REQUESTED_VERSION" >&2
+              echo "Could not resolve Hermes release version: $REQUESTED_VERSION" >&2
               exit 1
             fi
           fi
 
           SHA="$(git ls-remote "${{ env.HERMES_REPO }}" "$REF" | awk 'NR==1 {print $1}')"
           if [ -z "$SHA" ]; then
-            echo "Could not resolve Hermes ref: $REF" >&2
+            echo "Could not resolve Hermes release ref: $REF" >&2
             exit 1
           fi
 

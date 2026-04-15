@@ -1,0 +1,179 @@
+name: Build Hermes Runtime Image
+
+# Triggers:
+#   - Manual only: build on demand from a specific upstream Hermes ref
+on:
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: "Hermes upstream git ref to build (default: main)"
+        default: "main"
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/hermes-runtime
+  HERMES_REPO: https://github.com/NousResearch/hermes-agent.git
+
+jobs:
+  # ── Step 1: Resolve the upstream ref and skip if that exact commit is already built ──
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      canonical_tag: ${{ steps.resolve.outputs.canonical_tag }}
+    steps:
+      - name: Resolve Hermes ref
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          REF="${{ github.event.inputs.hermes_ref }}"
+          if [ -z "$REF" ]; then
+            REF="main"
+          fi
+
+          SHA="$(git ls-remote "${{ env.HERMES_REPO }}" "$REF" | awk 'NR==1 {print $1}')"
+          if [ -z "$SHA" ]; then
+            echo "Could not resolve Hermes ref: $REF" >&2
+            exit 1
+          fi
+
+          SHORT_SHA="$(printf '%s' "$SHA" | cut -c1-12)"
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          git clone --depth 1 "${{ env.HERMES_REPO }}" "$TMP_DIR/hermes" >/dev/null 2>&1
+          git -C "$TMP_DIR/hermes" fetch --depth 1 origin "$SHA" >/dev/null 2>&1
+          git -C "$TMP_DIR/hermes" checkout --detach "$SHA" >/dev/null 2>&1
+
+          VERSION="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$TMP_DIR/hermes/pyproject.toml")"
+
+          CANONICAL_TAG="git-${SHORT_SHA}"
+
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "canonical_tag=$CANONICAL_TAG" >> "$GITHUB_OUTPUT"
+
+          if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${CANONICAL_TAG} > /dev/null 2>&1; then
+            echo "Image for ${CANONICAL_TAG} already exists, skipping"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image for ${CANONICAL_TAG} not found, will build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Hermes Image Check" >> $GITHUB_STEP_SUMMARY
+          echo "- Ref: ${{ steps.resolve.outputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ steps.resolve.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ steps.resolve.outputs.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Canonical tag: ${{ steps.resolve.outputs.canonical_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Should build: ${{ steps.resolve.outputs.should_build }}" >> $GITHUB_STEP_SUMMARY
+
+  # ── Step 2: Build and push multi-arch image ──
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU (for ARM64 cross-compilation)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build smoke image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.hermes-slim
+          build-args: |
+            HERMES_REF=${{ needs.check.outputs.sha }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: hermes-runtime:ci-smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify smoke image
+        run: |
+          docker run --rm hermes-runtime:ci-smoke bash -c '
+            test -x /opt/hermes/.venv/bin/hermes &&
+            test -f /opt/hermes/.env.example &&
+            test -f /opt/hermes/cli-config.yaml.example &&
+            test -f /opt/hermes/docker/SOUL.md &&
+            test -f /opt/hermes/tools/skills_sync.py &&
+            /opt/hermes/.venv/bin/python3 -c "import importlib.metadata; print(importlib.metadata.version(\"hermes-agent\"))" &&
+            hermes --help >/dev/null
+          '
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.hermes-slim
+          build-args: |
+            HERMES_REF=${{ needs.check.outputs.sha }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:slim
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.canonical_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.title=Hermes Runtime
+            org.opencontainers.image.description=JishuShell-maintained Hermes runtime image with Python, venv, and shim-compatible filesystem layout
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Verify pushed image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.canonical_tag }}
+          IMAGE_VERSION=$(docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.canonical_tag }} \
+            bash -c '/opt/hermes/.venv/bin/python3 -c "import importlib.metadata; print(importlib.metadata.version(\"hermes-agent\"))"')
+          echo "Bundled Hermes version: $IMAGE_VERSION"
+          if [ "$IMAGE_VERSION" != "${{ needs.check.outputs.version }}" ]; then
+            echo "Expected Hermes ${{ needs.check.outputs.version }}, got $IMAGE_VERSION" >&2
+            exit 1
+          fi
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.canonical_tag }} \
+            bash -c 'command -v hermes && hermes --help >/dev/null'
+
+      - name: Summary
+        run: |
+          echo "### Hermes Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "- Ref: ${{ needs.check.outputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ needs.check.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ needs.check.outputs.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Tags:" >> $GITHUB_STEP_SUMMARY
+          echo "  - \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:slim\`" >> $GITHUB_STEP_SUMMARY
+          echo "  - \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "  - \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.canonical_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Platforms: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Pull: \`docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:slim\`" >> $GITHUB_STEP_SUMMARY

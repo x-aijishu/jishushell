@@ -118,7 +118,11 @@ is_promptable() {
     if [[ "${NO_PROMPT:-0}" == "1" ]]; then
         return 1
     fi
-    if [[ -r /dev/tty && -w /dev/tty ]]; then
+    # Web-triggered upgrades never have an interactive TTY
+    if [[ "${JISHUSHELL_WEB_UPDATE:-0}" == "1" ]]; then
+        return 1
+    fi
+    if ( : <> /dev/tty ) 2>/dev/null; then
         return 0
     fi
     return 1
@@ -161,7 +165,7 @@ JISHU_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd 2>/dev/null |
 # ──── BEGIN VERSIONS ────
 NODE_VERSION="${JISHU_NODE_VERSION:-22}"
 NVM_VERSION="${JISHU_NVM_VERSION:-0.40.4}"
-NOMAD_VERSION="${JISHU_NOMAD_VERSION:-1.11.3}"
+NOMAD_VERSION="${JISHU_NOMAD_VERSION:-1.6.5}"
 JISHUSHELL_PORT="${JISHUSHELL_PORT:-8090}"
 
 # ──── NPM Registry Configuration ────
@@ -223,6 +227,11 @@ SKIP_NOMAD="${SKIP_NOMAD:-0}"
 SKIP_OPENCLAW="${SKIP_OPENCLAW:-0}"  # default=0 (install); use --skip 4 or --skip-openclaw to skip
 SKIP_JISHUSHELL="${SKIP_JISHUSHELL:-0}"          # 1=skip install_jishushell
 SKIP_JISHUSHELL_SERVICE="${SKIP_JISHUSHELL_SERVICE:-0}"  # 1=skip service registration
+JISHUSHELL_NPM_VERSION="${JISHUSHELL_NPM_VERSION:-latest}"  # jishushell npm package version
+JISHUSHELL_VERSION_OVERRIDE=0
+if [[ "${JISHUSHELL_NPM_VERSION}" != "latest" ]]; then
+    JISHUSHELL_VERSION_OVERRIDE=1
+fi
 OPENCLAW_NPM_VERSION="${OPENCLAW_NPM_VERSION:-latest}"   # openclaw npm package version
 OPENCLAW_DOCKER_TAG="${OPENCLAW_DOCKER_TAG:-ghcr.io/x-aijishu/openclaw-runtime:latest}"  # pre-built image from registry
 OPENCLAW_IMAGE=""                                        # set dynamically after pull/build
@@ -448,6 +457,10 @@ check_sudo() {
 
     if ! sudo -n true 2>/dev/null; then
         ui_info "Some steps require sudo — you may be prompted for your password."
+        if ! is_promptable; then
+            ui_error "Failed to obtain sudo privileges (no interactive TTY available)"
+            exit 1
+        fi
         if ! sudo -v </dev/tty; then
             ui_error "Failed to obtain sudo privileges"
             exit 1
@@ -1413,12 +1426,24 @@ install_nomad() {
             if [[ -z "$current_version" ]]; then
                 ui_warn "Nomad at ${local_bin} is not functional (wrong arch or corrupt) — reinstalling..."
                 rm -f "$local_bin"
+            elif [[ "$current_version" == "$NOMAD_VERSION" ]]; then
+                ui_success "Nomad already at target version: v${current_version} → ${local_bin}"
+                _ensure_jishushell_bin_in_path
+                return 0
             elif version_gte "$current_version" "$NOMAD_VERSION"; then
-                ui_success "Nomad already installed: v${current_version} → ${local_bin}"
+                # current > target (the == case was handled above). JishuShell
+                # pins Nomad to a specific version on purpose (license downgrade
+                # from BSL 1.1 to MPL 2.0). Raft state is not backward compatible
+                # across the jump, so we auto-migrate: download + verify the new
+                # binary first (safe-first), then stop services, back up the old
+                # data_dir, wipe it, clean orphaned containers, and swap the
+                # binary. JishuShell re-bootstraps ACL and resubmits jobs from
+                # on-disk instance configs on the next start.
+                _migrate_nomad_to_target "$current_version" || return 1
                 _ensure_jishushell_bin_in_path
                 return 0
             else
-                ui_warn "Nomad version too old: v${current_version} (need >= v${NOMAD_VERSION}) — upgrading..."
+                ui_warn "Nomad version too old: v${current_version} (need v${NOMAD_VERSION}) — upgrading..."
                 rm -f "$local_bin"
             fi
         fi
@@ -1502,6 +1527,180 @@ REPO
     fi
 
     return 1
+}
+
+# Auto-migrate from a higher Nomad version (e.g. 1.11.3 BSL) back to the
+# jishushell target (1.6.5 MPL). Called when install_nomad detects a local
+# binary whose semver is > NOMAD_VERSION. The migration is destructive to
+# Nomad's raft state (schema is not backward compatible) but preserves
+# instance configs under ~/.jishushell/instances/*, which is what jishushell
+# uses to resubmit jobs after reboot. A single tar.gz snapshot of the old
+# data_dir is kept under ~/.jishushell/nomad/backups/ for forensic inspection
+# — it is not a user-recovery mechanism (the schema can't be replayed).
+_migrate_nomad_to_target() {
+    local current_version="$1"
+    local local_bin="${JISHUSHELL_BIN_DIR}/nomad"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        ui_info "[dry-run] Would migrate Nomad v${current_version} → v${NOMAD_VERSION}:"
+        ui_info "[dry-run]   1. Stage + verify new binary in /tmp"
+        ui_info "[dry-run]   2. Stop jishushell + nomad services"
+        ui_info "[dry-run]   3. Tar backup ${JISHUSHELL_HOME}/nomad/data → nomad/backups/data-<ts>.tar.gz"
+        ui_info "[dry-run]   4. Wipe raft state + nomad.env files (schema incompatible)"
+        ui_info "[dry-run]   5. Remove orphaned gateway-<alloc> containers"
+        ui_info "[dry-run]   6. Swap binary into ${local_bin}"
+        return 0
+    fi
+
+    ui_warn "Nomad v${current_version} > target v${NOMAD_VERSION} — auto-migrating (BSL → MPL)..."
+    ui_info "  Raft state is not backward-compatible; allocation history will be reset."
+    ui_info "  Instance configs under ${JISHUSHELL_HOME}/instances/ are preserved."
+
+    # ── Stage 1: download + verify new binary before touching anything ────
+    local stage_dir
+    stage_dir="$(mktemp -d)" || { ui_error "mktemp failed"; return 1; }
+    # shellcheck disable=SC2064
+    trap "rm -rf '$stage_dir'" RETURN
+
+    local platform
+    platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    local download_url="https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_${platform}_${ARCH}.zip"
+    local sums_url="https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_SHA256SUMS"
+
+    ui_info "Staging Nomad v${NOMAD_VERSION} (${platform}/${ARCH})..."
+    if ! retry_net "Download Nomad binary" 3 curl -fsSL "$download_url" -o "${stage_dir}/nomad.zip"; then
+        ui_error "Failed to download Nomad v${NOMAD_VERSION} — keeping existing v${current_version}"
+        return 1
+    fi
+    if ! retry_net "Download Nomad checksums" 3 curl -fsSL "$sums_url" -o "${stage_dir}/SHA256SUMS"; then
+        ui_error "Failed to download Nomad checksum file — aborting migration for security"
+        return 1
+    fi
+
+    local expected_hash actual_hash
+    expected_hash="$(grep "nomad_${NOMAD_VERSION}_${platform}_${ARCH}.zip" "${stage_dir}/SHA256SUMS" | awk '{print $1}')"
+    if [[ -z "$expected_hash" ]]; then
+        ui_error "No checksum entry for nomad_${NOMAD_VERSION}_${platform}_${ARCH}.zip — aborting"
+        return 1
+    fi
+    if command -v sha256sum &>/dev/null; then
+        actual_hash="$(sha256sum "${stage_dir}/nomad.zip" | awk '{print $1}')"
+    else
+        actual_hash="$(shasum -a 256 "${stage_dir}/nomad.zip" | awk '{print $1}')"
+    fi
+    if [[ "$expected_hash" != "$actual_hash" ]]; then
+        ui_error "Nomad checksum mismatch — download may have been tampered with!"
+        ui_error "  Expected: $expected_hash"
+        ui_error "  Got:      $actual_hash"
+        return 1
+    fi
+    ui_info "Checksum verified ✓"
+
+    if ! command -v unzip &>/dev/null; then
+        ui_info "Installing unzip..."
+        pkg_install unzip >/dev/null 2>&1
+    fi
+    if ! unzip -o "${stage_dir}/nomad.zip" nomad -d "${stage_dir}" >/dev/null 2>&1; then
+        if ! unzip -o "${stage_dir}/nomad.zip" -d "${stage_dir}" >/dev/null 2>&1; then
+            ui_error "Failed to extract staged Nomad archive"
+            return 1
+        fi
+    fi
+    chmod 755 "${stage_dir}/nomad" 2>/dev/null
+
+    local staged_version
+    staged_version="$("${stage_dir}/nomad" version 2>/dev/null | head -n1 | extract_semver || echo "")"
+    if [[ "$staged_version" != "$NOMAD_VERSION" ]]; then
+        ui_error "Staged binary reports v${staged_version:-unknown}, expected v${NOMAD_VERSION} — aborting"
+        return 1
+    fi
+    ui_success "Staged new Nomad binary v${staged_version}"
+
+    # ── Stage 2: destructive state changes begin ──────────────────────────
+    ui_info "Stopping services..."
+    ${SUDO} systemctl stop jishushell 2>/dev/null || true
+    ${SUDO} systemctl stop nomad 2>/dev/null || true
+    # pkill -f 'nomad agent' matches its own cmdline ("pkill -f nomad agent"
+    # literally contains the pattern) and self-terminates before reaching the
+    # real nomad process. Use pgrep -x nomad instead (exact proc-name match,
+    # pgrep's own comm is "pgrep" not "nomad").
+    local nomad_pids
+    nomad_pids="$(pgrep -x nomad 2>/dev/null | tr '\n' ' ')"
+    if [[ -n "$nomad_pids" ]]; then
+        # shellcheck disable=SC2086
+        ${SUDO} kill -TERM $nomad_pids 2>/dev/null || kill -TERM $nomad_pids 2>/dev/null || true
+        sleep 2
+        nomad_pids="$(pgrep -x nomad 2>/dev/null | tr '\n' ' ')"
+        if [[ -n "$nomad_pids" ]]; then
+            # shellcheck disable=SC2086
+            ${SUDO} kill -KILL $nomad_pids 2>/dev/null || kill -KILL $nomad_pids 2>/dev/null || true
+        fi
+    fi
+
+    # ── Stage 3: tar backup (single snapshot, overwrite any previous) ─────
+    local backup_file=""
+    local backup_dir="${JISHUSHELL_HOME}/nomad/backups"
+    if [[ -d "${JISHUSHELL_HOME}/nomad/data" ]]; then
+        mkdir -p "$backup_dir"
+        local ts
+        ts="$(date +%Y%m%d-%H%M%S)"
+        backup_file="${backup_dir}/data-${ts}.tar.gz"
+        ui_info "Backing up raft state → ${backup_file}"
+        if ! tar czf "$backup_file" -C "${JISHUSHELL_HOME}/nomad" data 2>/dev/null; then
+            ui_warn "Backup tar failed — continuing (raft state will still be wiped)"
+            backup_file=""
+        else
+            # Keep only the most recent snapshot to avoid unbounded disk growth
+            ls -t "${backup_dir}"/data-*.tar.gz 2>/dev/null | tail -n +2 | xargs -r rm -f
+        fi
+    fi
+
+    # ── Stage 4: wipe raft state + env files ─────────────────────────────
+    ${SUDO} rm -rf "${JISHUSHELL_HOME}/nomad/data"
+    rm -f "${JISHUSHELL_HOME}/nomad.env"
+    ${SUDO} rm -f /etc/jishushell/nomad.env
+
+    # ── Stage 5: orphaned gateway containers (alloc ids gone with raft) ──
+    # sudo npm install -g runs postinstall as the invoking user (typically pi),
+    # whose login shell may not have docker group access — the legacy install
+    # only granted docker to the nomad.service via SupplementaryGroups, not to
+    # the login shell. Try unprivileged first, fall back to sudo docker so this
+    # step works regardless of group membership.
+    if command -v docker &>/dev/null; then
+        local _docker="docker"
+        if ! docker ps >/dev/null 2>&1; then
+            _docker="${SUDO} docker"
+        fi
+        local gw_containers
+        gw_containers="$($_docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^gateway-' || true)"
+        if [[ -n "$gw_containers" ]]; then
+            local gw_count
+            gw_count="$(echo "$gw_containers" | wc -l)"
+            echo "$gw_containers" | xargs -r $_docker rm -f >/dev/null 2>&1 || true
+            ui_info "Removed ${gw_count} orphaned gateway container(s)"
+        fi
+    fi
+
+    # ── Stage 6: swap binary into place (atomic via temp name + rename) ──
+    mkdir -p "${JISHUSHELL_BIN_DIR}"
+    local dest_tmp="${local_bin}.tmp.$$"
+    if ! cp "${stage_dir}/nomad" "$dest_tmp"; then
+        ui_error "Failed to copy new Nomad binary into place"
+        [[ -n "$backup_file" ]] && ui_error "  Backup preserved at: ${backup_file}"
+        return 1
+    fi
+    chmod 755 "$dest_tmp"
+    if ! mv -f "$dest_tmp" "$local_bin"; then
+        ui_error "Failed to swap Nomad binary"
+        [[ -n "$backup_file" ]] && ui_error "  Backup preserved at: ${backup_file}"
+        rm -f "$dest_tmp"
+        return 1
+    fi
+
+    ui_success "Nomad migrated to v${NOMAD_VERSION}"
+    [[ -n "$backup_file" ]] && ui_info "  Backup (forensic, not self-recovery): ${backup_file}"
+    ui_info "  JishuShell will re-bootstrap ACL and resubmit jobs from instance configs on next start."
+    return 0
 }
 
 _install_nomad_binary() {
@@ -1849,14 +2048,17 @@ install_nomad_systemd() {
 
     _ensure_nomad_hcl
 
+    # Nomad 1.6.5's docker driver fingerprint requires euid==0 (PR #18197 lifted
+    # the root requirement only in 1.7+, which is BSL). The panel stays as the
+    # installing user via a separate unit; it talks to this agent over HTTP so
+    # ~/.jishushell/nomad/data/ can be root-owned without breaking anything.
     local service_content="[Unit]
 Description=Nomad Agent
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
-User=${REAL_USER}
-SupplementaryGroups=docker
+User=root
 Type=simple
 EnvironmentFile=-/etc/jishushell/nomad.env
 ExecStart=${nomad_bin} agent -config=${config_file}
@@ -1879,8 +2081,12 @@ WantedBy=multi-user.target"
         need_reload=1
     fi
 
-    # Ensure Nomad data dirs are owned by the real user before the service starts
+    # Keep the real user owning ~/.jishushell except for Nomad's own state,
+    # which must be root-owned because the agent runs as root for driver fingerprinting.
     chown -R "${REAL_USER}:${REAL_GID:-${REAL_USER}}" "${JISHUSHELL_HOME}" 2>/dev/null || true
+    if [[ -d "${nomad_config_dir}/data" ]]; then
+        ${SUDO} chown -R root:root "${nomad_config_dir}/data" 2>/dev/null || true
+    fi
 
     if [[ $need_reload -eq 1 ]]; then
         ${SUDO} systemctl daemon-reload
@@ -2211,6 +2417,14 @@ _prompt_openclaw_skip() {
     esac
 }
 
+jishushell_package_spec() {
+    if [[ "${JISHUSHELL_VERSION_OVERRIDE}" == "1" || "${JISHUSHELL_NPM_VERSION}" != "latest" ]]; then
+        printf 'jishushell@%s' "${JISHUSHELL_NPM_VERSION}"
+        return 0
+    fi
+    printf 'jishushell'
+}
+
 # show_install_plan [--with-jishushell]
 show_install_plan() {
     local with_jishushell=0
@@ -2226,17 +2440,19 @@ show_install_plan() {
     ui_kv "Node.js"     "$(if [[ $SKIP_NODE   -eq 1 ]]; then echo 'skip'; else echo "v${NODE_VERSION} via nvm v${NVM_VERSION}"; fi)"
     ui_kv "Docker"      "$(if [[ $SKIP_DOCKER -eq 1 ]]; then echo 'skip'; else echo 'latest stable'; fi)"
     ui_kv "Nomad"       "$(if [[ $SKIP_NOMAD  -eq 1 ]]; then echo 'skip'; else echo "v${NOMAD_VERSION}"; fi)"
-    ui_kv "OpenClaw"    "$(if [[ \"${SKIP_OPENCLAW}\" == \"1\" ]]; then echo 'skip'; else echo \"docker pull ${OPENCLAW_DOCKER_TAG}\"; fi)"
+    ui_kv "OpenClaw"    "$(if [[ "${SKIP_OPENCLAW}" == "1" ]]; then echo 'skip'; else echo "docker pull ${OPENCLAW_DOCKER_TAG}"; fi)"
     if [[ $with_jishushell -eq 1 ]]; then
         local _plan_jishu
         if [[ $SKIP_JISHUSHELL -eq 1 ]]; then
             _plan_jishu="skip"
         else
             local _plan_tgz=""
-            for _c in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
-                [[ -f "$_c" ]] && { _plan_tgz="$(basename "$_c")"; break; }
-            done
-            _plan_jishu="${_plan_tgz:+npm install -g ${_plan_tgz} (local)}${_plan_tgz:-npm install -g jishushell}"
+            if [[ "${JISHUSHELL_VERSION_OVERRIDE}" != "1" && "${JISHUSHELL_NPM_VERSION}" == "latest" ]]; then
+                for _c in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
+                    [[ -f "$_c" ]] && { _plan_tgz="$(basename "$_c")"; break; }
+                done
+            fi
+            _plan_jishu="${_plan_tgz:+npm install -g ${_plan_tgz} (local)}${_plan_tgz:-npm install -g $(jishushell_package_spec)}"
         fi
         ui_kv "JishuShell"         "$_plan_jishu"
         ui_kv "JishuShell service" "$(if [[ $SKIP_JISHUSHELL_SERVICE -eq 1 ]]; then echo 'skip'; else echo 'register autostart'; fi)"
@@ -2401,16 +2617,20 @@ install_jishushell() {
     fi
 
     if [[ "$DRY_RUN" == "1" ]]; then
+        local jishushell_pkg_spec
+        jishushell_pkg_spec="$(jishushell_package_spec)"
         local _dry_reg=""
         [[ -n "${NPM_REGISTRY:-}" ]] && _dry_reg=" --registry ${NPM_REGISTRY}"
         local _dry_tgz=""
-        for _c in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
-            [[ -f "$_c" ]] && { _dry_tgz="$_c"; break; }
-        done
+        if [[ "${JISHUSHELL_VERSION_OVERRIDE}" != "1" && "${JISHUSHELL_NPM_VERSION}" == "latest" ]]; then
+            for _c in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
+                [[ -f "$_c" ]] && { _dry_tgz="$_c"; break; }
+            done
+        fi
         if [[ -n "$_dry_tgz" ]]; then
             ui_info "[dry-run] Would: npm install -g ${_dry_tgz}  (local package)"
         else
-            ui_info "[dry-run] Would: npm install -g jishushell${_dry_reg}"
+            ui_info "[dry-run] Would: npm install -g ${jishushell_pkg_spec}${_dry_reg}"
         fi
         ui_info "[dry-run] Would write wrapper: ${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
         return 0
@@ -2441,6 +2661,8 @@ install_jishushell() {
         return 1
     fi
 
+    local jishushell_pkg_spec
+    jishushell_pkg_spec="$(jishushell_package_spec)"
     local npm_registry_args=()
     if [[ -n "${NPM_REGISTRY:-}" ]]; then
         if [[ ! "$NPM_REGISTRY" =~ ^https?:// ]]; then
@@ -2448,9 +2670,9 @@ install_jishushell() {
             return 1
         fi
         npm_registry_args=("--registry" "${NPM_REGISTRY}")
-        ui_info "Installing jishushell from ${NPM_REGISTRY}..."
+        ui_info "Installing ${jishushell_pkg_spec} from ${NPM_REGISTRY}..."
     else
-        ui_info "Installing jishushell from public npm registry..."
+        ui_info "Installing ${jishushell_pkg_spec} from public npm registry..."
     fi
 
     # When jishushell is already installed (e.g. running as npm postinstall hook),
@@ -2459,12 +2681,14 @@ install_jishushell() {
         # Prefer a local .tgz package in the same directory as this script.
         local tgz_path=""
         local _tgz_candidate
-        for _tgz_candidate in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
-            if [[ -f "$_tgz_candidate" ]]; then
-                tgz_path="$_tgz_candidate"
-                break
-            fi
-        done
+        if [[ "${JISHUSHELL_VERSION_OVERRIDE}" != "1" && "${JISHUSHELL_NPM_VERSION}" == "latest" ]]; then
+            for _tgz_candidate in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
+                if [[ -f "$_tgz_candidate" ]]; then
+                    tgz_path="$_tgz_candidate"
+                    break
+                fi
+            done
+        fi
 
         # Export a sentinel so post-install.sh (triggered by npm's postinstall
         # lifecycle hook) knows it was launched from inside jishu-install.sh and
@@ -2480,10 +2704,10 @@ install_jishushell() {
                 return 1
             fi
         else
-            log_detail "[$(date '+%H:%M:%S')] ${npm_bin} install -g jishushell ${npm_registry_args[*]:-}"
-            if ! log_cmd "$npm_bin" install -g jishushell ${npm_registry_args[@]+"${npm_registry_args[@]}"}; then
+            log_detail "[$(date '+%H:%M:%S')] ${npm_bin} install -g ${jishushell_pkg_spec} ${npm_registry_args[*]:-}"
+            if ! log_cmd "$npm_bin" install -g "${jishushell_pkg_spec}" "${npm_registry_args[@]}"; then
                 unset JISHU_RUNNING_IN_INSTALLER
-                ui_error "npm install -g jishushell failed"
+                ui_error "npm install -g ${jishushell_pkg_spec} failed"
                 return 1
             fi
         fi
@@ -2787,8 +3011,17 @@ parse_args() {
                 shift
                 OPENCLAW_NPM_VERSION="${1:?--openclaw-version requires a version argument (e.g. 3.24)}"
                 ;;
+            --openclaw-docker-tag)
+                shift
+                OPENCLAW_DOCKER_TAG="${1:?--openclaw-docker-tag requires a tag argument (e.g. ghcr.io/x-aijishu/openclaw-runtime:2026.4.9)}"
+                ;;
             --skip-jishushell)         SKIP_JISHUSHELL=1 ;;
             --skip-jishushell-service) SKIP_JISHUSHELL_SERVICE=1 ;;
+            --jishushell-version)
+                shift
+                JISHUSHELL_NPM_VERSION="${1:?--jishushell-version requires a version argument (e.g. 0.4.9)}"
+                JISHUSHELL_VERSION_OVERRIDE=1
+                ;;
             --skip)
                 shift
                 IFS=',' read -ra _steps <<< "${1:-}"
@@ -2854,10 +3087,16 @@ Options:
   --skip-docker              Skip step 2: Docker installation
   --skip-nomad               Skip step 3: Nomad installation
   --skip-openclaw            Skip step 4: OpenClaw installation
+    --openclaw-docker-tag <tag>
+                                                         Pull a specific OpenClaw image tag
+                                                         (e.g. --openclaw-docker-tag ghcr.io/x-aijishu/openclaw-runtime:2026.4.9)
   --skip-jishushell          Skip step 5: JishuShell installation
   --skip-jishushell-service  Skip step 6: JishuShell service registration
+    --jishushell-version <ver>
+                                                         Install a specific jishushell version
+                                                         (e.g. --jishushell-version 0.4.9)
   --registry <url>           Use a custom npm registry for all installs
-                             (e.g. --registry http://10.188.0.22:4873/)
+                             (e.g. --registry http://127.0.0.1:4873/)
   --yes, -y                  Skip all confirmation prompts
   --help, -h                 Show this help message
 
@@ -2873,12 +3112,16 @@ Environment variables:
   JISHU_NODE_VERSION    Specify Node.js major version (default: ${NODE_VERSION})
   JISHU_NVM_VERSION     Specify nvm version         (default: ${NVM_VERSION})
   JISHU_NOMAD_VERSION   Specify Nomad version       (default: ${NOMAD_VERSION})
+    JISHUSHELL_NPM_VERSION
+                                                 Specify jishushell npm package version (default: latest)
   OPENCLAW_NPM_VERSION  Specify openclaw npm package version (default: latest)
-  OPENCLAW_DOCKER_TAG   Override built Docker image tag      (default: jishushell-base:v1)
+    OPENCLAW_DOCKER_TAG   Override OpenClaw Docker image tag   (default: ${OPENCLAW_DOCKER_TAG})
   NPM_REGISTRY          Custom npm registry URL (same as --registry flag)
 
-OpenClaw version flag (equivalent to OPENCLAW_NPM_VERSION env var):
-  --openclaw-version <ver>   Install a specific openclaw version, e.g. --openclaw-version 3.24
+Version flags:
+    --jishushell-version <ver>  Install a specific jishushell version, e.g. --jishushell-version 0.4.9
+    --openclaw-version <ver>    Install a specific openclaw version, e.g. --openclaw-version 3.24
+    --openclaw-docker-tag <tag> Pull a specific OpenClaw image tag, e.g. --openclaw-docker-tag ghcr.io/x-aijishu/openclaw-runtime:2026.4.9
   NO_PROMPT             Set to 1 to skip interactive prompts
   VERBOSE               Set to 1 for verbose output
 
@@ -2948,12 +3191,11 @@ _prompt_install_confirm() {
         fi
         if [[ $SKIP_NOMAD -eq 0 ]]; then
             echo -e "  ${BOLD}Nomad${NC}"
-            echo -e "  ${MUTED}  Nomad v${NOMAD_VERSION}+ (>= 1.7.0)${NC}"
-            echo -e "  ${MUTED}    URL     : https://github.com/hashicorp/nomad${NC}"
-            echo -e "  ${MUTED}    License : Business Source License 1.1 (BSL 1.1)${NC}"
-            echo -e "  ${MUTED}              https://github.com/hashicorp/nomad/blob/main/LICENSE${NC}"
-            echo -e "  ${MUTED}    Licensor: International Business Machines Corporation (IBM)${NC}"
-            echo -e "  ${MUTED}    Work    : Nomad Version 1.7.0 or later. (c) 2024 IBM Corp.${NC}"
+            echo -e "  ${MUTED}  Nomad v${NOMAD_VERSION} (last MPL 2.0 release in the 1.6.x line)${NC}"
+            echo -e "  ${MUTED}    URL     : https://github.com/hashicorp/nomad/tree/v${NOMAD_VERSION}${NC}"
+            echo -e "  ${MUTED}    License : Mozilla Public License 2.0${NC}"
+            echo -e "  ${MUTED}              https://github.com/hashicorp/nomad/blob/v${NOMAD_VERSION}/LICENSE${NC}"
+            echo -e "  ${MUTED}    Author  : HashiCorp, Inc.${NC}"
             echo ""
         fi
         echo -e "  ${ACCENT}─────────────────────────────────────────────────────────${NC}"

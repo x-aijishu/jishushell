@@ -36,10 +36,63 @@ RUN git clone --recurse-submodules "${HERMES_REPO}" hermes && \
     git checkout "${HERMES_REF}" && \
     git submodule update --init --recursive
 
+#
+# Skip the `tinker-atropos` submodule install. It brings in the RL
+# training stack (transformers, datasets, wandb, gymnasium, polars,
+# pyarrow, safetensors, …) — ~300 MB of deps used only by
+# `tools/rl_training_tool.py` and `environments/*.py`, both of which
+# are lazy-imported and only exercised during model training runs.
+# JishuShell targets inference on edge devices (Pi / RK3588 / CIX), no
+# RL training happens here, so we match the upstream
+# `nousresearch/hermes-agent` image's choice to omit it.
+#
 WORKDIR /opt/hermes
 RUN uv venv .venv --python 3.11 && \
-    uv pip install --python .venv/bin/python -e ".[all]" && \
-    if [ -d tinker-atropos ]; then uv pip install --python .venv/bin/python -e "./tinker-atropos"; fi
+    uv pip install --python .venv/bin/python -e ".[all]"
+
+#
+# Small extras the upstream image bundles but `[all]` doesn't pull.
+# Both are tiny (~0.3 MB each) so we match the upstream image rather
+# than leave users `pip install`-ing them by hand.
+#   - apscheduler: cron-style scheduler used by the agent's job tools
+#   - qrcode + pypng: QR image generation using pure-Python PNG
+#     backend (avoids dragging Pillow in)
+#
+RUN uv pip install --python .venv/bin/python apscheduler qrcode pypng
+
+#
+# Three things happen here:
+#
+#   1. `npm install --omit=dev` vendors agent-browser + its transitive
+#      deps (playwright-core, better-sqlite3, impit, zod, lodash, …)
+#      into /opt/hermes/node_modules (~171 MB). This is what
+#      `hermes's browser_tool.py` resolves when it runs `npx
+#      agent-browser` — without pre-installing we'd pay a ~15 s npm
+#      download on the first browser_navigate call of every fresh
+#      container.
+#
+#   2. `playwright install chromium --only-shell` drops the headless
+#      Chromium renderer (~330 MB) under $PLAYWRIGHT_BROWSERS_PATH.
+#      agent-browser auto-discovers it via that env var, so we don't
+#      need an apt `chromium` in the final image — just the shared
+#      libs headless_shell links against (installed in the final
+#      stage).  `--package=playwright` borrows the Playwright CLI
+#      without persisting its own node_modules.
+#
+#   3. The native web UI (`hermes web`, served on port 9119) is built
+#      and its build-time node_modules removed; only the ~8 MB dist
+#      bundle ships.
+#
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+RUN if [ -f package.json ]; then \
+      npm install --omit=dev --prefer-offline --no-audit --no-fund ; \
+    fi && \
+    npx --yes --package=playwright playwright install chromium --only-shell && \
+    if [ -f web/package.json ]; then \
+      (cd web && npm install --prefer-offline --no-audit --no-fund && npm run build) && \
+      rm -rf web/node_modules ; \
+    fi && \
+    npm cache clean --force
 
 RUN rm -rf /root/.cache /tmp/* .git .github website tests .pytest_cache .mypy_cache .ruff_cache && \
     find /opt/hermes -type d -name "__pycache__" -prune -exec rm -rf {} + && \
@@ -51,19 +104,59 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HERMES_HOME=/opt/data \
     PATH=/opt/hermes/.venv/bin:${PATH} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright \
     PYTHONDONTWRITEBYTECODE=1
 
+#
+# The headless Chromium binary itself rides in from the builder stage
+# (see PLAYWRIGHT_BROWSERS_PATH above). What the final stage adds is:
+#
+#   • Chromium runtime libs: the 17 .so dependencies headless_shell
+#     dynamically links against. Same set that
+#     `playwright install --with-deps chromium` would pull in on
+#     Debian 12 — explicit here so the diff is auditable.
+#   • curl: `hermes auth login` device-code OAuth flow + ad-hoc HTTP.
+#   • poppler-utils: pdftotext / pdfinfo back Hermes's PDF readers.
+#
+# Note: capability-specific Python packages (python-pptx, weasyprint,
+# pillow, xlsxwriter, qrcode, dingtalk SDK, …) are NOT baked in —
+# users `pip install --user` them on demand via the `terminal` tool.
+# Same for `whatsapp-bridge`, which our panel's channel plugins don't
+# rely on.
+#
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
+    curl \
     ffmpeg \
+    fonts-liberation \
     git \
     gosu \
+    libasound2 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libatspi2.0-0 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libx11-6 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    poppler-utils \
     procps \
     python3 \
     python3-venv \
-    ripgrep \
-    tini && \
+    ripgrep && \
     ln -sf /usr/bin/python3 /usr/local/bin/python && \
     rm -rf /var/lib/apt/lists/*
 
@@ -77,4 +170,9 @@ WORKDIR /opt/hermes
 RUN mkdir -p /opt/data && \
     chown -R hermes:hermes /opt/data /home/hermes
 
+# Zombie reaping is handled by Nomad's `init: true` flag (docker-init
+# becomes PID 1 regardless of this image's entrypoint — see the hermes
+# adapter's docker Config). We deliberately leave ENTRYPOINT unset so
+# anyone running this image directly with `docker run --init` gets the
+# same guarantee without surprise.
 CMD ["hermes", "--help"]

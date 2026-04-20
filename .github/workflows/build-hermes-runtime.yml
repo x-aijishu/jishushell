@@ -9,6 +9,11 @@ on:
         description: "Hermes release version to build (default: latest release tag)"
         default: "latest"
         required: false
+      force_rebuild:
+        description: "Force rebuild even if the image tag already bundles the resolved version (use when Dockerfile itself changed)"
+        type: boolean
+        default: false
+        required: false
 
 env:
   REGISTRY: ghcr.io
@@ -83,6 +88,15 @@ jobs:
 
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # If the operator passed force_rebuild=true, always rebuild even
+          # when the tag exists — use this when the Dockerfile changed but
+          # the bundled Hermes version didn't.
+          if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
+            echo "force_rebuild=true, skipping existing-image check"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # If the tag exists, verify the image actually contains the expected
           # Hermes version before skipping the rebuild.

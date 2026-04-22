@@ -170,6 +170,21 @@ WORKDIR /opt/hermes
 RUN mkdir -p /opt/data && \
     chown -R hermes:hermes /opt/data /home/hermes
 
+# Bake the jishushell orchestration shim into the image. The panel used
+# to bind-mount this from ~/.jishushell/runtimes/hermes/ but that coupled
+# instance startup to a host file outside the instance dir. Baking it in
+# keeps all runtime-critical assets inside the image, and the LABEL below
+# lets the panel detect whether a pulled image actually has it.
+COPY templates/hermes-entrypoint.sh /usr/local/bin/jishushell-hermes-entry.sh
+RUN chmod 0755 /usr/local/bin/jishushell-hermes-entry.sh
+
+# Advertise the protocol contract this image satisfies. The panel reads
+# this label via `docker inspect` before launching an instance; a panel
+# that only knows protocol version N refuses to start an image that
+# declares N+1, which is how we gate rolling upgrades without silent
+# behavioral drift.
+LABEL runtime.protocol.version="1"
+
 # Zombie reaping is handled by Nomad's `init: true` flag (docker-init
 # becomes PID 1 regardless of this image's entrypoint — see the hermes
 # adapter's docker Config). We deliberately leave ENTRYPOINT unset so

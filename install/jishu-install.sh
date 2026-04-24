@@ -1887,7 +1887,24 @@ _ensure_nomad_hcl() {
     # LAN IP doesn't exist inside the Lima VM, causing "cannot assign requested
     # address" when Docker tries to bind to it.
     local loopback_iface="lo"
+    local external_iface=""
+    local external_host_network_block=""
     [[ "$OS" == "macos" ]] && loopback_iface="lo0"
+
+    if [[ "$OS" == "macos" ]]; then
+        external_iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+    elif command -v ip >/dev/null 2>&1; then
+        external_iface="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    fi
+
+    if [[ -n "$external_iface" && "$external_iface" != "$loopback_iface" ]]; then
+        external_host_network_block=$(cat <<EOF
+  host_network "external" {
+    interface = "${external_iface}"
+  }
+EOF
+)
+    fi
 
     cat > "$config_file" << NOMAD_HCL
 data_dir = "${nomad_data_dir}"
@@ -1912,6 +1929,7 @@ client {
   servers = ["127.0.0.1:4647"]
   network_interface = "${loopback_iface}"
   alloc_dir = "${nomad_alloc_dir}"
+${external_host_network_block}
 
   drain_on_shutdown {
     deadline           = "30s"
@@ -2705,7 +2723,13 @@ install_jishushell() {
             fi
         else
             log_detail "[$(date '+%H:%M:%S')] ${npm_bin} install -g ${jishushell_pkg_spec} ${npm_registry_args[*]:-}"
-            if ! log_cmd "$npm_bin" install -g "${jishushell_pkg_spec}" "${npm_registry_args[@]}"; then
+            if [[ ${#npm_registry_args[@]} -gt 0 ]]; then
+                if ! log_cmd "$npm_bin" install -g "${jishushell_pkg_spec}" "${npm_registry_args[@]}"; then
+                    unset JISHU_RUNNING_IN_INSTALLER
+                    ui_error "npm install -g ${jishushell_pkg_spec} failed"
+                    return 1
+                fi
+            elif ! log_cmd "$npm_bin" install -g "${jishushell_pkg_spec}"; then
                 unset JISHU_RUNNING_IN_INSTALLER
                 ui_error "npm install -g ${jishushell_pkg_spec} failed"
                 return 1

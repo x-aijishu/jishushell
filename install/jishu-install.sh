@@ -2868,7 +2868,6 @@ Environment=HOME=${REAL_HOME}
 Environment=JISHUSHELL_HOME=${JISHUSHELL_HOME}
 ProtectSystem=strict
 PrivateTmp=true
-NoNewPrivileges=true
 ReadWritePaths=${JISHUSHELL_HOME} /etc/jishushell
 
 [Install]

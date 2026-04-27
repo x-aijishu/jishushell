@@ -918,6 +918,14 @@ _load_nvm() {
 install_node() {
     ui_stage "Node.js (via nvm)"
 
+    # On macOS, ensure Command Line Tools are installed BEFORE npm-gyp modules
+    # during nvm/Node.js build, not just before Homebrew
+    if [[ "${OS:-}" == "macos" ]]; then
+        if ! ensure_macos_command_line_tools; then
+            return 1
+        fi
+    fi
+
     _load_nvm 2>/dev/null || true
 
     if command -v node &>/dev/null; then

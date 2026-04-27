@@ -365,7 +365,7 @@ detect_os() {
             PKG_MANAGER="brew"
         else
             PKG_MANAGER="none"
-            ui_warn "Homebrew not found — some optional installs may be skipped"
+            ui_info "Homebrew not found — it will be installed automatically if needed"
         fi
         ui_success "OS: ${OS_NAME} (package manager: ${PKG_MANAGER})"
         return 0
@@ -412,6 +412,84 @@ detect_os() {
 
     OS="linux"
     ui_success "OS: ${OS_NAME} (package manager: ${PKG_MANAGER})"
+}
+
+activate_homebrew_shellenv() {
+    local brew_bin=""
+    local shellenv=""
+
+    if command -v brew >/dev/null 2>&1; then
+        brew_bin="$(command -v brew)"
+    elif [[ -x "/opt/homebrew/bin/brew" ]]; then
+        brew_bin="/opt/homebrew/bin/brew"
+    elif [[ -x "/usr/local/bin/brew" ]]; then
+        brew_bin="/usr/local/bin/brew"
+    else
+        return 1
+    fi
+
+    if ! shellenv="$(${brew_bin} shellenv 2>/dev/null)"; then
+        return 1
+    fi
+    eval "${shellenv}"
+    PKG_MANAGER="brew"
+    return 0
+}
+
+ensure_homebrew_macos() {
+    if [[ "${OS:-}" != "macos" ]]; then
+        return 1
+    fi
+
+    if activate_homebrew_shellenv; then
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        ui_info "[dry-run] Would install Homebrew via the official installer"
+        return 0
+    fi
+
+    ui_info "Homebrew not found — installing via the official installer..."
+    if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+        ui_warn "Homebrew install failed"
+        return 1
+    fi
+
+    if ! activate_homebrew_shellenv; then
+        ui_warn "Homebrew installed but brew is not available in this shell yet"
+        ui_info "Run one of the following commands, then re-run this installer:"
+        ui_info "  eval \"\$(/opt/homebrew/bin/brew shellenv)\""
+        ui_info "  eval \"\$(/usr/local/bin/brew shellenv)\""
+        return 1
+    fi
+
+    ui_success "Homebrew installed"
+    return 0
+}
+
+ensure_macos_command_line_tools() {
+    if xcode-select -p >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        ui_info "[dry-run] Would run: xcode-select --install"
+        return 0
+    fi
+
+    ui_info "Installing Xcode Command Line Tools (required for make/clang)"
+    xcode-select --install || true
+
+    if ! xcode-select -p >/dev/null 2>&1; then
+        ui_warn "Xcode Command Line Tools are not ready yet"
+        ui_info "The installer has been started with: xcode-select --install"
+        ui_info "Complete the installer dialog, then re-run this installer"
+        return 1
+    fi
+
+    ui_success "Xcode Command Line Tools are ready"
+    return 0
 }
 
 # Detect CPU architecture.  Sets: ARCH (arm64)
@@ -461,7 +539,7 @@ check_sudo() {
             ui_error "Failed to obtain sudo privileges (no interactive TTY available)"
             exit 1
         fi
-        if ! sudo -v </dev/tty; then
+        if ! sudo -p "Password: " -v </dev/tty; then
             ui_error "Failed to obtain sudo privileges"
             exit 1
         fi
@@ -721,17 +799,11 @@ install_build_tools_linux() {
 
 install_build_tools_macos() {
     local ok=true
-    if ! xcode-select -p >/dev/null 2>&1; then
-        ui_info "Installing Xcode Command Line Tools (required for make/clang)"
-        xcode-select --install >/dev/null 2>&1 || true
-        if ! xcode-select -p >/dev/null 2>&1; then
-            ui_warn "Xcode Command Line Tools are not ready yet"
-            ui_info "Complete the installer dialog, then re-run this installer"
-            ok=false
-        fi
+    if ! ensure_macos_command_line_tools; then
+        ok=false
     fi
     if ! command -v cmake >/dev/null 2>&1; then
-        if command -v brew >/dev/null 2>&1; then
+        if ensure_homebrew_macos; then
             run_quiet_step "Installing cmake" brew install cmake
         else
             ui_warn "Homebrew not available; cannot auto-install cmake"
@@ -1054,8 +1126,7 @@ _do_install_docker() {
 
     if [[ "$OS" == "macos" ]]; then
         ui_info "Installing docker and colima via Homebrew..."
-        if ! command -v brew &>/dev/null; then
-            ui_warn "Homebrew not found. Install it from https://brew.sh then re-run this script."
+        if ! ensure_homebrew_macos; then
             return 1
         fi
         brew install -q docker colima || { ui_warn "brew install failed"; return 1; }
